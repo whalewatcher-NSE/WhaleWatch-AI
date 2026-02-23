@@ -1,15 +1,7 @@
 """
 fetch_data.py — Standalone NSE Data Fetcher for GitHub Actions
 ==============================================================
-Called daily by .github/workflows/scrape.yml at 7 PM IST.
-Behaviour:
-  1. Fetches today's bhavcopy + delivery data from NSE via nselib
-  2. Saves a daily snapshot CSV to data/daily/YYYY-MM-DD.csv
-  3. Recomputes the rolling whale_history.csv (last 60 trading days)
-  4. Exits cleanly if today's data already exists (idempotent)
-Usage:
-  python fetch_data.py              # Fetch today's data
-  python fetch_data.py --bootstrap  # Seed last 30 trading days
+Enhanced version: Also fetches FII/DII aggregate flows and Bulk/Block deals.
 """
 import sys
 import os
@@ -23,13 +15,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DAILY_DIR = os.path.join(DATA_DIR, "daily")
 HISTORY_FILE = os.path.join(DATA_DIR, "whale_history.csv")
-# ---- Thresholds (must match app.py) ----
-MIN_DELIVERY_PCT = 50.0
-MIN_VOLUME_RATIO = 2.0
-MIN_PRICE_CHANGE_PCT = 3.0
-MA_WINDOW = 20
+FII_DII_FILE = os.path.join(DATA_DIR, "fii_dii.csv")
+BULK_DEALS_FILE = os.path.join(DATA_DIR, "bulk_deals.csv")
+# ---- Config ----
 MAX_HISTORY_DAYS = 60
-# ---- Column aliases (same as app.py) ----
+# Column aliases (same as app.py)
 COLUMN_ALIASES = {
     "symbol": ["SYMBOL", "Symbol", "TckrSymb", "TCKR_SYMB"],
     "series": ["SERIES", "Series", "SrNm", "SERIES "],
@@ -37,22 +27,10 @@ COLUMN_ALIASES = {
     "high": ["HIGH_PRICE", "HIGH", "HghPric", "HIGH_PRICE "],
     "low": ["LOW_PRICE", "LOW", "LwPric", "LOW_PRICE "],
     "close": ["CLOSE_PRICE", "CLOSE", "ClsPric", "CLOSE_PRICE "],
-    "prev_close": [
-        "PREV_CLOSE", "PREVCLOSE", "PrvsClsgPric",
-        "PREV_CLOSE ", "PREV_CLS_PRICE",
-    ],
-    "volume": [
-        "TTL_TRD_QNTY", "TOTTRDQTY", "TtlTradgVol",
-        "TOTAL_TRADE_QUANTITY", "TTL_TRD_QNTY ",
-    ],
-    "delivery_qty": [
-        "DELIV_QTY", "DlvryQty", "DELIVERY_QTY", "DELIV_QTY ",
-    ],
-    "delivery_pct": [
-        "DELIV_PER", "DlvryPct", "DELIVERY_PCT",
-        "DELIV_PER ", " DELIV_PER",
-    ],
-    "date": ["DATE1", "DATE", "TIMESTAMP", "TradDt", "Date"],
+    "prev_close": ["PREV_CLOSE", "PREVCLOSE", "PrvsClsgPric", "PREV_CLOSE ", "PREV_CLS_PRICE"],
+    "volume": ["TTL_TRD_QNTY", "TOTTRDQTY", "TtlTradgVol", "TOTAL_TRADE_QUANTITY", "TTL_TRD_QNTY "],
+    "delivery_qty": ["DELIV_QTY", "DlvryQty", "DELIVERY_QTY", "DELIV_QTY "],
+    "delivery_pct": ["DELIV_PER", "DlvryPct", "DELIVERY_PCT", "DELIV_PER ", " DELIV_PER"],
 }
 def resolve_column(df, canonical):
     aliases = COLUMN_ALIASES.get(canonical, [])
@@ -73,87 +51,146 @@ def normalize_dataframe(df):
     required = ["symbol", "close", "prev_close", "volume"]
     for col in required:
         if col not in df.columns:
-            print(f"  ⚠ Missing required column: {col}")
             return None
     if "series" in df.columns:
         df = df[df["series"].str.strip() == "EQ"].copy()
-    for col in ["open", "high", "low", "close", "prev_close",
-                 "volume", "delivery_qty", "delivery_pct"]:
+    for col in ["open", "high", "low", "close", "prev_close", "volume", "delivery_qty", "delivery_pct"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["symbol", "close", "volume"])
     return df
 def fetch_for_date(target_date):
-    """Fetch NSE data for a specific date. Returns normalised DataFrame or None."""
+    """Fetch NSE data for a specific date (Bhavcopy + Delivery)."""
     date_str = target_date.strftime("%d-%m-%Y")
-    print(f"  📡 Fetching data for {date_str} ...")
+    print(f"  📡 Fetching daily stock data for {date_str} ...")
     try:
         from nselib import capital_market
         raw = capital_market.bhav_copy_with_delivery(date_str)
         df = normalize_dataframe(raw)
         if df is not None and len(df) > 0:
             df["date"] = target_date.strftime("%Y-%m-%d")
-            print(f"  ✅ Got {len(df)} stocks")
+            print(f"  ✅ Got {len(df)} stocks (bhav_copy_with_delivery)")
             return df
     except Exception as e:
-        print(f"  ⚠ bhav_copy_with_delivery failed: {e}")
+        pass
     try:
         from nselib import capital_market
         raw = capital_market.bhav_copy_equities(date_str)
         df = normalize_dataframe(raw)
         if df is not None and len(df) > 0:
             df["date"] = target_date.strftime("%Y-%m-%d")
-            print(f"  ✅ Got {len(df)} stocks (fallback)")
+            print(f"  ✅ Got {len(df)} stocks (fallback: bhav_copy_equities)")
             return df
     except Exception as e:
-        print(f"  ⚠ bhav_copy_equities also failed: {e}")
-    print(f"  ❌ No data available for {date_str}")
+        pass
+    print(f"  ❌ No stock data available for {date_str}")
     return None
+def fetch_fii_dii():
+    """Fetch today's FII/DII flow data and append to CSV."""
+    print("  📡 Fetching FII/DII activity...")
+    today_str = date.today().strftime("%Y-%m-%d")
+    result = {"date": today_str}
+    
+    try:
+        from nselib import capital_market
+        raw = capital_market.fii_dii_trading_activity()
+        if raw is not None and not raw.empty:
+            for _, row in raw.iterrows():
+                category = str(row.get("category", row.get("Category", ""))).strip()
+                buy = pd.to_numeric(row.get("buyValue", row.get("BUY_VALUE", row.get("buy_value", 0))), errors="coerce") or 0
+                sell = pd.to_numeric(row.get("sellValue", row.get("SELL_VALUE", row.get("sell_value", 0))), errors="coerce") or 0
+                net = buy - sell
+                
+                if "FII" in category.upper() or "FPI" in category.upper():
+                    result.update({"fii_buy": buy, "fii_sell": sell, "fii_net": net})
+                elif "DII" in category.upper():
+                    result.update({"dii_buy": buy, "dii_sell": sell, "dii_net": net})
+            
+            if "fii_net" in result or "dii_net" in result:
+                new_df = pd.DataFrame([result])
+                # Append to existing
+                if os.path.exists(FII_DII_FILE):
+                    try:
+                        old_df = pd.read_csv(FII_DII_FILE)
+                        # Remove today's date if already exists to avoid duplicates
+                        old_df = old_df[old_df["date"] != today_str]
+                        df = pd.concat([old_df, new_df], ignore_index=True)
+                        # Keep last 30 days
+                        df = df.tail(30)
+                    except Exception:
+                        df = new_df
+                else:
+                    df = new_df
+                
+                df.to_csv(FII_DII_FILE, index=False)
+                print("  ✅ Saved FII/DII data")
+                return True
+    except Exception as e:
+        print(f"  ⚠ Failed to fetch FII/DII: {e}")
+    return False
+def fetch_bulk_block_deals():
+    """Fetch today's Bulk and Block deals and save to a single CSV."""
+    print("  📡 Fetching Bulk/Block deals...")
+    frames = []
+    
+    try:
+        from nselib import capital_market
+        raw_bulk = capital_market.bulk_deal_data()
+        if raw_bulk is not None and not raw_bulk.empty:
+            raw_bulk["Deal_Type"] = "BULK"
+            frames.append(raw_bulk)
+            print(f"  ✅ Got {len(raw_bulk)} Bulk deals")
+    except Exception as e:
+        print(f"  ⚠ Failed to fetch bulk deals: {e}")
+    try:
+        from nselib import capital_market
+        raw_block = capital_market.block_deal_data()
+        if raw_block is not None and not raw_block.empty:
+            raw_block["Deal_Type"] = "BLOCK"
+            frames.append(raw_block)
+            print(f"  ✅ Got {len(raw_block)} Block deals")
+    except Exception as e:
+        print(f"  ⚠ Failed to fetch block deals: {e}")
+    if frames:
+        df = pd.concat(frames, ignore_index=True)
+        # We overwrite this file daily because we only care about "today's" deals
+        df.to_csv(BULK_DEALS_FILE, index=False)
+        print("  💾 Saved Bulk/Block deals to CSV")
+        return True
+    
+    return False
 def save_daily_csv(df, target_date):
-    """Save a daily snapshot CSV."""
     os.makedirs(DAILY_DIR, exist_ok=True)
     filename = target_date.strftime("%Y-%m-%d") + ".csv"
     filepath = os.path.join(DAILY_DIR, filename)
     df.to_csv(filepath, index=False)
-    print(f"  💾 Saved daily CSV: {filepath}")
+    print(f"  💾 Saved daily history: {filepath}")
     return filepath
 def rebuild_history():
-    """Rebuild whale_history.csv from daily CSVs (keep last MAX_HISTORY_DAYS)."""
     if not os.path.isdir(DAILY_DIR):
-        print("  ⚠ No daily CSV directory found.")
         return
     csv_files = sorted([f for f in os.listdir(DAILY_DIR) if f.endswith(".csv")])
     if not csv_files:
-        print("  ⚠ No daily CSVs found.")
         return
-    # Keep only the last MAX_HISTORY_DAYS files
     files_to_keep = csv_files[-MAX_HISTORY_DAYS:]
     files_to_prune = csv_files[:-MAX_HISTORY_DAYS] if len(csv_files) > MAX_HISTORY_DAYS else []
-    # Prune old files
     for old_file in files_to_prune:
-        old_path = os.path.join(DAILY_DIR, old_file)
-        os.remove(old_path)
-        print(f"  🗑  Pruned old file: {old_file}")
-    # Concatenate remaining files
+        os.remove(os.path.join(DAILY_DIR, old_file))
     frames = []
     for f in files_to_keep:
         try:
             frames.append(pd.read_csv(os.path.join(DAILY_DIR, f)))
-        except Exception as e:
-            print(f"  ⚠ Error reading {f}: {e}")
+        except Exception:
+            continue
     if frames:
         history = pd.concat(frames, ignore_index=True)
-        # Add computed columns for the history file
         if "prev_close" in history.columns and "close" in history.columns:
             history["price_change_pct"] = (
                 (history["close"] - history["prev_close"]) / history["prev_close"] * 100
             ).round(2)
         history.to_csv(HISTORY_FILE, index=False)
-        print(f"  📊 Rebuilt whale_history.csv — {len(history)} rows from {len(files_to_keep)} days")
-    else:
-        print("  ⚠ No valid CSVs to combine.")
+        print(f"  📊 Rebuilt whale_history.csv — {len(history)} total rows")
 def get_trading_dates(n=30):
-    """Return last N weekdays."""
     dates = []
     current = date.today()
     while len(dates) < n:
@@ -162,28 +199,27 @@ def get_trading_dates(n=30):
             dates.append(current)
     return dates
 def run_today():
-    """Fetch today's data (idempotent — skips if already exists)."""
     today = date.today()
-    # If today is weekend, skip
     if today.weekday() >= 5:
         print(f"📅 Today ({today}) is a weekend. Skipping.")
         return
-    # Check if today's file already exists
+    # 1. Fetch auxiliary data (always run this to get latest deals/flows)
+    fetch_fii_dii()
+    fetch_bulk_block_deals()
+    # 2. Fetch main stock data
     daily_file = os.path.join(DAILY_DIR, today.strftime("%Y-%m-%d") + ".csv")
     if os.path.exists(daily_file):
-        print(f"✅ Data for {today} already exists. Skipping fetch.")
+        print(f"✅ Main stock data for {today} already exists. Skipping main fetch.")
         rebuild_history()
         return
-    # Fetch today's data
     df = fetch_for_date(today)
     if df is not None and not df.empty:
         save_daily_csv(df, today)
         rebuild_history()
-        print(f"\n🎉 Done! Fetched {len(df)} stocks for {today}")
+        print(f"\n🎉 Done! Fetched info for {len(df)} stocks on {today}")
     else:
-        print(f"\n⚠ Could not fetch data for {today}. NSE may not have published yet.")
+        print(f"\n⚠ Could not fetch stock data for {today}.")
 def run_bootstrap():
-    """Seed the last 30 trading days of data."""
     print("🚀 Bootstrap mode: fetching last 30 trading days...\n")
     os.makedirs(DAILY_DIR, exist_ok=True)
     trading_dates = get_trading_dates(30)
@@ -192,28 +228,20 @@ def run_bootstrap():
         if os.path.exists(daily_file):
             print(f"  ⏭  {td} already exists, skipping.")
             continue
+            
         df = fetch_for_date(td)
         if df is not None and not df.empty:
             save_daily_csv(df, td)
-        else:
-            print(f"  ⏭  No data for {td} (may be a holiday)")
-        # Rate-limit: be nice to NSE servers
-        if i < len(trading_dates) - 1:
-            time.sleep(2)
+        time.sleep(1.5)  # Rate limiting
     rebuild_history()
+    # Also fetch today's auxiliary data during bootstrap
+    fetch_fii_dii()
+    fetch_bulk_block_deals()
     print("\n🎉 Bootstrap complete!")
 def main():
-    parser = argparse.ArgumentParser(description="WhaleWatch AI — NSE Data Fetcher")
-    parser.add_argument(
-        "--bootstrap",
-        action="store_true",
-        help="Seed the last 30 trading days of data",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bootstrap", action="store_true")
     args = parser.parse_args()
-    print("=" * 50)
-    print("🐋 WhaleWatch AI — Data Fetcher")
-    print("=" * 50)
-    print()
     os.makedirs(DATA_DIR, exist_ok=True)
     if args.bootstrap:
         run_bootstrap()
