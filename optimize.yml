@@ -1,0 +1,32 @@
+name: "🧠 Train Whale AI Strategy"
+
+on:
+  workflow_dispatch:  # This creates the manual 'Run' button
+
+jobs:
+  optimize-strategy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install Dependencies
+        # We install dependencies here so you don't have to worry about requirements.txt errors
+        run: |
+          pip install pandas numpy requests matplotlib tqdm pyarrow fastparquet
+
+      - name: 🚀 Run Optimization
+        run: python analyze_strategy.py
+
+      - name: 📤 Upload Results (Downloadable)
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-results
+          path: strategy_results.csv
