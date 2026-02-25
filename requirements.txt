@@ -1,5 +1,5 @@
 streamlit==1.41.1
 pandas==2.2.3
 numpy==2.2.2
-nselib
+nselib==1.6.0
 requests==2.32.3
