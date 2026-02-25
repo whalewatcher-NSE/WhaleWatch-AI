@@ -1,9 +1,9 @@
 """
-📊 WhaleWatch Master Analyst v3 (Deep Debug & Fallback)
-=======================================================
-1. Prints ALL raw column names to identify the 'Delivery' column.
-2. Force-calculates Delivery % from Qty if needed.
-3. Fallback: If Delivery data is missing, runs Volume-Only strategy.
+📊 WhaleWatch Master Analyst v4 (Force Math)
+============================================
+1. Force-calculates Delivery % from (Delivery Qty / Volume).
+2. Checks row 50 (not row 0) to verify Volume Ratio.
+3. Prints non-zero delivery stats to confirm data fix.
 """
 import pandas as pd
 import numpy as np
@@ -31,36 +31,17 @@ def standardize_columns(df):
     df.columns = [c.lower().strip().replace(' ', '_') for c in df.columns]
     
     col_map = {
-        # Standard
         'symbol': 'symbol', 'ticker': 'symbol',
         'date': 'date', 'timestamp': 'date',
         'close': 'close', 'close_price': 'close',
         'volume': 'volume', 'ttl_trd_qnty': 'volume', 'total_traded_quantity': 'volume',
-        
-        # Delivery Variations (Add any you suspect!)
-        'delivery_quantity': 'delivery_qty', 
-        'deliv_qty': 'delivery_qty',
-        'delivery_qty': 'delivery_qty',
-        'dlvry_qty': 'delivery_qty',
-        'qty_delivered': 'delivery_qty',
-        
-        # Delivery % Variations
-        'delivery_pct': 'delivery_pct',
-        'deliv_per': 'delivery_pct',
-        'delivery_percentage': 'delivery_pct',
-        'pct_deliv': 'delivery_pct'
+        'delivery_quantity': 'delivery_qty', 'deliv_qty': 'delivery_qty', 'delivery_qty': 'delivery_qty',
+        'delivery_pct': 'delivery_pct', 'deliv_per': 'delivery_pct'
     }
     
     new_cols = {}
     for c in df.columns:
-        # Check exact match
-        if c in col_map:
-            new_cols[c] = col_map[c]
-        # Check partial match (dangerous but effective)
-        elif 'deliv' in c and 'qty' in c:
-            new_cols[c] = 'delivery_qty'
-        elif 'deliv' in c and ('per' in c or 'pct' in c):
-            new_cols[c] = 'delivery_pct'
+        if c in col_map: new_cols[c] = col_map[c]
             
     df = df.rename(columns=new_cols)
     return df
@@ -78,7 +59,6 @@ def load_data():
         try:
             if f.endswith('.parquet'): df = pd.read_parquet(f)
             else: df = pd.read_csv(f)
-            # Only keep non-empty
             if not df.empty: dfs.append(df)
         except Exception as e: 
             print(f"⚠️ Error reading {f}: {e}")
@@ -91,34 +71,39 @@ def load_data():
     
     # 2. Ensure Types
     df['date'] = pd.to_datetime(df['date'])
-    for col in ['close', 'volume', 'delivery_qty', 'delivery_pct']:
+    for col in ['close', 'volume', 'delivery_qty']:
         if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
         
     df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
     
-    # 3. CRITICAL: Calculate Delivery % if missing
-    if 'delivery_pct' not in df.columns:
-        if 'delivery_qty' in df.columns and 'volume' in df.columns:
-            print("ℹ️ Calculating Delivery % from Quantity...")
-            df['delivery_pct'] = (df['delivery_qty'] / df['volume']) * 100
-        else:
-            print("⚠️ WARNING: No Delivery Data Found! Using Volume-Only Strategy.")
-            # Set to 100 so it passes the "min delivery" filter, effectively disabling it
-            df['delivery_pct'] = 100.0 
-            
-    # 4. Fill NaNs
-    df['delivery_pct'] = df['delivery_pct'].fillna(0)
-    
-    # 5. Calculate Indicators
+    # 3. CRITICAL: Force Recalculate Delivery %
+    # We ignore the existing 'delivery_pct' because the logs showed it was 0.0
+    if 'delivery_qty' in df.columns and 'volume' in df.columns:
+        print("ℹ️ RE-CALCULATING Delivery % from Quantity (ignoring raw column)...")
+        df['delivery_pct'] = (df['delivery_qty'] / df['volume']) * 100
+        df['delivery_pct'] = df['delivery_pct'].fillna(0)
+    else:
+        print("⚠️ WARNING: Missing 'delivery_qty' or 'volume'. Cannot calculate delivery!")
+        df['delivery_pct'] = 0.0
+
+    # 4. Indicators
     print("🔮 Calculating indicators...")
     df['turnover'] = df['close'] * df['volume']
     df['vol_ma'] = df.groupby('symbol')['volume'].transform(lambda x: x.rolling(20).mean())
     df['vol_ratio'] = df['volume'] / df['vol_ma']
     df['pct_change'] = df.groupby('symbol')['close'].pct_change() * 100
     
-    print("\n🔎 FINAL DATA CHECK (First 3 Rows):")
-    cols_to_show = [c for c in ['date', 'symbol', 'close', 'delivery_pct', 'vol_ratio'] if c in df.columns]
-    print(df[cols_to_show].head(3).to_string())
+    # DEBUG: Check Row 50 (so MA is populated) and verify Delivery
+    print("\n🔎 DATA CHECK (Row 50-53):")
+    valid_data = df[df['vol_ratio'].notna()].head(3)
+    if not valid_data.empty:
+        print(valid_data[['date', 'symbol', 'close', 'delivery_pct', 'vol_ratio']].to_string())
+    else:
+        print("⚠️ Still no valid volume ratio data found (maybe too few rows per symbol?).")
+
+    # Verify Delivery isn't all zeros
+    non_zero_deliv = (df['delivery_pct'] > 0).sum()
+    print(f"ℹ️ Rows with Non-Zero Delivery: {non_zero_deliv} / {len(df)}")
     print("-" * 50)
          
     return df
@@ -144,12 +129,10 @@ def simulate_trades(df, universe_list, params):
     
     pnl_log = []
     
-    # Simplified loop for speed
     for idx, row in entries.iterrows():
         symbol = row['symbol']
         buy_price = row['close']
         
-        # Smart Lookahead (Vectorized approach possible but loop is safer for logic)
         future = df_liquid[(df_liquid['symbol'] == symbol) & (df_liquid['date'] > row['date'])].head(15)
         if future.empty: continue
         
@@ -172,11 +155,14 @@ def run_analysis():
     if full_df is None: return
     
     years = sorted(full_df['date'].dt.year.unique())
+    print(f"📅 Data Years: {years}")
+    
     keys, values = zip(*GRID.items())
     combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
     
     print(f"\n⏩ STARTING ANALYSIS ({len(combinations)} Strategies per Year)")
     results_log = []
+    cumulative_growth = 1.0
     
     for i in range(len(years) - 1):
         train_year = years[i]
@@ -204,7 +190,9 @@ def run_analysis():
         print(f"Year {test_year} | Best: {cfg_short} | Result: {res_str}")
         
         results_log.append({"Year": test_year, "Config": str(best_config), "Return": result})
+        if result != -99: cumulative_growth *= (1 + result)
         
+    print(f"\n💰 CUMULATIVE RETURN: {(cumulative_growth - 1)*100:.2f}%")
     pd.DataFrame(results_log).to_csv("strategy_results.csv", index=False)
 
 if __name__ == "__main__":
