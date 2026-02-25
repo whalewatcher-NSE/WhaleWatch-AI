@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for proper merging
 
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
@@ -41,9 +43,17 @@ jobs:
             python fetch_data.py
           fi
 
+      - name: 🔄 Sync with repo (Pull latest changes)
+        # This step fixes the error you saw! It pulls your code changes before saving data.
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase --autostash || echo "Nothing to pull or merge conflict"
+
       - name: 💾 Commit & push updated data
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "📊 Auto-update: NSE data for ${{ github.event.schedule && 'scheduled run' || 'manual run' }}"
           file_pattern: "data/**"
           branch: main
+          skip_fetch: false # Ensure we double-check before pushing
