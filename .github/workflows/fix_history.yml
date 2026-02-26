@@ -1,0 +1,108 @@
+# .github/workflows/fix_history.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# WhaleWatch — Fix Historical Delivery Data (Run Once)
+#
+# WHAT THIS DOES:
+#   Re-downloads NSE data WITH delivery quantities for 2021-2025.
+#   Your current parquet files have delivery_qty as all NaN.
+#   This fixes that so the backtester can actually find trades.
+#
+# HOW TO RUN:
+#   GitHub repo → Actions tab
+#   → "Fix Historical Delivery Data"
+#   → Run workflow button
+#   → Choose years → Click green Run
+#
+# TIME: ~20 min per year, ~90 min total for 2021-2025
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: "Fix Historical Delivery Data (Run Once)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "Start year to fix"
+        required: true
+        default: "2021"
+        type: choice
+        options: ["2021", "2022", "2023", "2024", "2025"]
+
+      end_year:
+        description: "End year to fix"
+        required: true
+        default: "2025"
+        type: choice
+        options: ["2021", "2022", "2023", "2024", "2025", "2026"]
+
+      force:
+        description: "Force re-download even if data looks good?"
+        required: true
+        default: "no"
+        type: choice
+        options: ["no", "yes"]
+
+jobs:
+  fix-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: "Setup Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: "Install libraries"
+        run: |
+          pip install --upgrade pip
+          pip install nselib pandas "pyarrow>=18.0.0" numpy requests tqdm -q
+          echo "Libraries installed"
+
+      - name: "Ensure folders exist"
+        run: mkdir -p data/history data/daily
+
+      - name: "Check quality BEFORE fix"
+        run: python fix_history.py --check_only || echo "No files found yet"
+
+      - name: "Run the historical data fix"
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ github.event.inputs.force }}" = "yes" ]; then
+            FORCE_FLAG="--force"
+          fi
+          python fix_history.py \
+            --start_year ${{ github.event.inputs.start_year }} \
+            --end_year   ${{ github.event.inputs.end_year }} \
+            $FORCE_FLAG
+
+      - name: "Check quality AFTER fix"
+        run: python fix_history.py --check_only
+
+      - name: "Commit fixed files to repo"
+        run: |
+          git config user.email "whalewatch-bot@github-actions"
+          git config user.name "WhaleWatch Bot"
+          git add data/history/*.parquet 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Fix delivery data ${{ github.event.inputs.start_year }}-${{ github.event.inputs.end_year }} $(date '+%Y-%m-%d')"
+            git push
+            echo "Fixed files committed"
+          fi
+
+      - name: "Upload as artifact"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "fixed-history-${{ github.event.inputs.start_year }}-${{ github.event.inputs.end_year }}"
+          path: data/history/
+          retention-days: 30
