@@ -1,167 +1,45 @@
-# .github/workflows/daily_auto.yml
-# ─────────────────────────────────────────────────────────────────────────────
-# WhaleWatch — Daily Auto Scan
-#
-# RUNS: Every weekday at 7:00 PM IST (1:30 PM UTC)
-#       With a retry at 8:00 PM IST (2:30 PM UTC) if first run gets no data
-#
-# THE RETRY SOLVES THIS PROBLEM:
-#   NSE publishes Bhavcopy and delivery files between 6:30–8:00 PM IST.
-#   If our action runs at 7 PM and NSE hasn't published yet, we get nothing.
-#   The retry at 8 PM catches those days.
-#
-# WHAT IT DOES EACH EVENING:
-#   1. Downloads today's Bhavcopy + delivery data from NSE
-#   2. Computes WhaleScores for all stocks
-#   3. Saves results to results/ folder
-#   4. Sends Telegram alert with top signals
-#   5. Commits new data to repo
-# ─────────────────────────────────────────────────────────────────────────────
-
-name: "🐋 Daily Scan (7 PM IST + 8 PM retry)"
+name: "🐋 Daily Dashboard Pipeline"
 
 on:
   schedule:
-    - cron: "30 13 * * 1-5"    # 1:30 PM UTC = 7:00 PM IST — first attempt
-    - cron: "30 14 * * 1-5"    # 2:30 PM UTC = 8:00 PM IST — retry if needed
-  workflow_dispatch:             # Manual trigger anytime from Actions tab
+    - cron: "30 13 * * 1-5" # 7:00 PM IST
+    - cron: "30 14 * * 1-5" # 8:00 PM IST (Retry)
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  daily-scan:
+  run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     steps:
-      - name: "📂 Checkout repo"
+      - name: 📥 Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
 
-      - name: "🐍 Setup Python 3.11"
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: "📦 Install libraries"
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 📥 Step 1 - Fetch Daily Data
         run: |
-          pip install pandas pyarrow>=18.0.0 numpy requests tqdm -q
-          echo "✅ Libraries ready"
-
-      - name: "📁 Ensure folders exist"
-        run: mkdir -p data/history data/processed results
-
-      - name: "🔍 Check if today already downloaded"
-        id: check_existing
-        run: |
-          TODAY=$(date '+%Y-%m-%d')
-          echo "today=$TODAY" >> $GITHUB_OUTPUT
-
-          # Check if today's results already exist from the 7 PM run
-          if [ -f "results/signals_${TODAY}.csv" ]; then
-            echo "already_done=true" >> $GITHUB_OUTPUT
-            echo "✅ Today's signals already exist — skipping (this is the 8 PM retry)"
-          else
-            echo "already_done=false" >> $GITHUB_OUTPUT
-            echo "🔄 No data yet for $TODAY — proceeding with download"
-          fi
-
-      - name: "📥 Step 1 — Download today's NSE data (with retry)"
-        if: steps.check_existing.outputs.already_done == 'false'
-        id: download
-        run: |
-          echo "Attempting data download for $(date '+%Y-%m-%d')..."
-
-          # Try up to 3 times with 10-minute gaps
-          # NSE sometimes takes time to publish files after market close
           for attempt in 1 2 3; do
-            echo "--- Attempt $attempt of 3 ---"
-            python src/data_loader.py --mode daily
-
-            # Check if we got today's data
-            TODAY=$(date '+%Y-%m-%d')
-            YEAR=$(date '+%Y')
-
-            if python -c "
-          import pandas as pd
-          from pathlib import Path
-          import sys
-
-          f = Path('data/history/${YEAR}.parquet')
-          if not f.exists():
-              print('File not found')
-              sys.exit(1)
-
-          df = pd.read_parquet(f)
-          df['DATE'] = pd.to_datetime(df['DATE'])
-          today = pd.Timestamp('${TODAY}')
-
-          if today in df['DATE'].values:
-              count = len(df[df['DATE'] == today])
-              print(f'SUCCESS: {count} stocks downloaded for ${TODAY}')
-              sys.exit(0)
-          else:
-              print('Today not in data yet')
-              sys.exit(1)
-          "; then
-              echo "✅ Download successful on attempt $attempt"
-              echo "download_success=true" >> $GITHUB_OUTPUT
-              break
-            else
-              if [ $attempt -lt 3 ]; then
-                echo "⏳ Data not ready yet. NSE may not have published. Waiting 10 minutes..."
-                sleep 600
-              else
-                echo "❌ All 3 attempts failed. NSE data may not be available today."
-                echo "download_success=false" >> $GITHUB_OUTPUT
-              fi
-            fi
+            echo "--- Attempt $attempt ---"
+            python src/data_loader.py
+            if [ $? -eq 0 ]; then break; fi
+            if [ $attempt -lt 3 ]; then sleep 600; fi
           done
 
-      - name: "🔍 Step 2 — Compute WhaleScores"
-        if: |
-          steps.check_existing.outputs.already_done == 'false' &&
-          steps.download.outputs.download_success == 'true'
-        run: |
-          python src/feature_engine.py --mode daily --top 25
-          echo "✅ Scoring complete"
+      - name: 🧠 Step 2 - Compute Conviction Scores
+        run: python src/feature_engine.py
 
-      - name: "💾 Step 3 — Save results to repo"
-        if: steps.check_existing.outputs.already_done == 'false'
-        run: |
-          git config user.email "whalewatch-bot@github-actions"
-          git config user.name "WhaleWatch Bot"
-
-          git add data/history/ data/processed/ results/ || true
-
-          if git diff --staged --quiet; then
-            echo "No new data to save today"
-          else
-            git commit -m "📈 Daily scan $(date '+%Y-%m-%d %H:%M IST') — auto"
-            git push
-            echo "✅ Results saved to repo"
-          fi
-
-      - name: "📋 Upload results as artifact"
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: 💾 Step 3 - Commit to Repo
+        uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          name: "signals-$(date '+%Y-%m-%d')"
-          path: results/
-          retention-days: 90
-
-      - name: "📊 Summary"
-        if: always()
-        run: |
-          echo "=== RUN SUMMARY ==="
-          echo "Date:           $(date '+%Y-%m-%d %H:%M UTC')"
-          echo "Already done:   ${{ steps.check_existing.outputs.already_done }}"
-          echo "Download:       ${{ steps.download.outputs.download_success }}"
-          echo ""
-          if [ -f "results/latest_signals.csv" ]; then
-            echo "Latest signals file: EXISTS"
-            wc -l results/latest_signals.csv
-          else
-            echo "Latest signals file: NOT FOUND"
-          fi
+          commit_message: "📈 Daily Pipeline: Scrape & Score"
+          file_pattern: "data/** results/**"
+          branch: main
