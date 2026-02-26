@@ -17,6 +17,16 @@ DAILY_DIR.mkdir(exist_ok=True)
 
 HEADERS = {'user-agent': 'Mozilla/5.0', 'referer': 'https://www.nseindia.com/'}
 
+# Robust Column Mapping
+COLUMN_ALIASES = {
+    "symbol":       ["SYMBOL", "Symbol", "symbol"],
+    "series":       ["SERIES", "Series", "series"],
+    "close":        ["CLOSE_PRICE", "CLOSE", "close", "last_price"],
+    "volume":       ["TTL_TRD_QNTY", "TOTTRDQTY", "TOTAL_TRADE_QUANTITY", "volume"],
+    "delivery_qty": ["DELIV_QTY", "DlvryQty", "DELIVERY_QTY", "delivery_qty"],
+    "delivery_pct": ["DELIV_PER", "DlvryPct", "DELIVERY_PCT", "delivery_pct"],
+}
+
 def get_session():
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -29,17 +39,37 @@ def fetch_daily_bhavcopy(today_str):
         from nselib import capital_market
         raw = capital_market.bhav_copy_with_delivery(today_str)
         if raw is not None and not raw.empty:
-            raw.columns = [c.strip().lower().replace(' ', '_') for c in raw.columns]
+            # 1. Strip and lowercase all raw columns
+            raw.columns = [str(c).strip().lower().replace(' ', '_') for c in raw.columns]
             
-            # Map columns
-            col_map = {'tottrdqty': 'volume', 'deliv_qty': 'delivery_qty', 'deliv_per': 'delivery_pct'}
-            raw = raw.rename(columns={k: v for k, v in col_map.items() if k in raw.columns})
+            # 2. Build mapping dictionary
+            rename_map = {}
+            for canonical, aliases in COLUMN_ALIASES.items():
+                for alias in aliases:
+                    rename_map[alias.lower().replace(' ', '_')] = canonical
+                    
+            # 3. Rename columns
+            raw = raw.rename(columns={k: v for k, v in rename_map.items() if k in raw.columns})
             
+            # 4. Filter and select
             if 'series' in raw.columns:
-                raw = raw[raw['series'] == 'EQ']
+                raw = raw[raw['series'].str.strip() == 'EQ']
                 
             raw['date'] = pd.to_datetime(today_str, format="%d-%m-%Y")
-            return raw[['symbol', 'date', 'close', 'volume', 'delivery_qty', 'delivery_pct']]
+            
+            # Ensure columns exist before selecting
+            required_cols = ['symbol', 'date', 'close', 'volume']
+            missing = [c for c in required_cols if c not in raw.columns]
+            if missing:
+                print(f"Missing critical columns after mapping: {missing}")
+                return None
+                
+            # Safely get delivery data if it exists
+            final_cols = ['symbol', 'date', 'close', 'volume']
+            if 'delivery_qty' in raw.columns: final_cols.append('delivery_qty')
+            if 'delivery_pct' in raw.columns: final_cols.append('delivery_pct')
+                
+            return raw[final_cols]
     except Exception as e:
         print(f"Bhavcopy Error: {e}")
     return None
@@ -101,7 +131,7 @@ def main():
         print(f"✅ Downloaded successfully for {today_str}")
         exit(0)
     else:
-        print("❌ Data not published yet.")
+        print("❌ Data not published yet or mapping failed.")
         exit(1) # Triggers GitHub retry
 
 if __name__ == "__main__":
